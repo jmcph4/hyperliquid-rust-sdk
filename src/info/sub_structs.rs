@@ -12,7 +12,7 @@ pub struct UniverseItem {
     pub name: String,
     pub sz_decimals: u32,
     pub max_leverage: u32,
-    pub only_isolated: bool,
+    pub only_isolated: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
