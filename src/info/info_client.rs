@@ -7,8 +7,8 @@ use crate::{
     prelude::*,
     req::HttpClient,
     ws::{Subscription, WsManager},
-    BaseUrl, Error, Message, PerpetualsAssetContextsResponse, OrderStatusResponse, ReferralResponse, UserFeesResponse,
-    UserFundingResponse, UserTokenBalanceResponse,
+    BaseUrl, Error, Message, OrderStatusResponse, PerpetualsAssetContextsResponse,
+    ReferralResponse, UserFeesResponse, UserFundingResponse, UserTokenBalanceResponse,
 };
 
 use ethers::types::H160;

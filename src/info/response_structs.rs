@@ -1,7 +1,7 @@
 use crate::{
     info::{AssetPosition, Level, MarginSummary},
-    DailyUserVlm, Delta, FeeSchedule, OrderInfo, Referrer, ReferrerState, UserTokenBalance,
-    PerpetualAssetContext, Universe, UniverseItem,
+    DailyUserVlm, Delta, FeeSchedule, OrderInfo, PerpetualAssetContext, Referrer, ReferrerState,
+    Universe, UniverseItem, UserTokenBalance,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
