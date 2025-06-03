@@ -1,5 +1,5 @@
 use ethers::types::H160;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Deserialize, Clone, Debug)]
@@ -10,6 +10,7 @@ pub struct Trade {
     pub sz: String,
     pub time: u64,
     pub hash: String,
+    pub tid: u64,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -47,17 +48,40 @@ pub struct TradeInfo {
     pub cloid: Option<String>,
     pub crossed: bool,
     pub fee: String,
+    pub fee_token: String,
+    pub tid: u64,
 }
 
 #[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct UserFillsData {
+    pub is_snapshot: Option<bool>,
     pub user: H160,
     pub fills: Vec<TradeInfo>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
-pub struct UserData {
-    pub fills: Vec<TradeInfo>,
+#[serde(rename_all = "camelCase")]
+pub enum UserData {
+    Fills(Vec<TradeInfo>),
+    Funding(UserFunding),
+    Liquidation(Liquidation),
+    NonUserCancel(Vec<NonUserCancel>),
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct Liquidation {
+    pub lid: u64,
+    pub liquidator: String,
+    pub liquidated_user: String,
+    pub liquidated_ntl_pos: String,
+    pub liquidated_account_value: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct NonUserCancel {
+    pub coin: String,
+    pub oid: u64,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -244,4 +268,57 @@ pub struct SpotTransfer {
 pub struct SpotGenesis {
     pub token: String,
     pub amount: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct NotificationData {
+    pub notification: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct WebData2Data {
+    pub user: H160,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveAssetCtxData {
+    pub coin: String,
+    pub ctx: AssetCtx,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
+pub enum AssetCtx {
+    Perps(PerpsAssetCtx),
+    Spot(SpotAssetCtx),
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedAssetCtx {
+    pub day_ntl_vlm: String,
+    pub prev_day_px: String,
+    pub mark_px: String,
+    pub mid_px: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PerpsAssetCtx {
+    #[serde(flatten)]
+    pub shared: SharedAssetCtx,
+    pub funding: String,
+    pub open_interest: String,
+    pub oracle_px: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotAssetCtx {
+    #[serde(flatten)]
+    pub shared: SharedAssetCtx,
+    pub circulating_supply: String,
 }

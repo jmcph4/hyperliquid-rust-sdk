@@ -9,7 +9,7 @@ use tokio::sync::mpsc::unbounded_channel;
 use crate::{
     bps_diff, truncate_float, BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder,
     ClientOrderRequest, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient,
-    Message, Subscription, EPSILON,
+    Message, Subscription, UserData, EPSILON,
 };
 #[derive(Debug)]
 pub struct MarketMakerRestingOrder {
@@ -18,6 +18,7 @@ pub struct MarketMakerRestingOrder {
     pub price: f64,
 }
 
+#[derive(Debug)]
 pub struct MarketMakerInput {
     pub asset: String,
     pub target_liquidity: f64, // Amount of liquidity on both sides to target
@@ -28,6 +29,7 @@ pub struct MarketMakerInput {
     pub wallet: LocalWallet, // Wallet containing private key
 }
 
+#[derive(Debug)]
 pub struct MarketMaker {
     pub asset: String,
     pub target_liquidity: f64,
@@ -122,18 +124,20 @@ impl MarketMaker {
                     if self.latest_mid_price < 0.0 {
                         continue;
                     }
-                    let fills = user_events.data.fills;
-                    for fill in fills {
-                        let amount: f64 = fill.sz.parse().unwrap();
-                        // Update our resting positions whenever we see a fill
-                        if fill.side.eq("B") {
-                            self.cur_position += amount;
-                            self.lower_resting.position -= amount;
-                            info!("Fill: bought {amount} {}", self.asset.clone());
-                        } else {
-                            self.cur_position -= amount;
-                            self.upper_resting.position -= amount;
-                            info!("Fill: sold {amount} {}", self.asset.clone());
+                    let user_events = user_events.data;
+                    if let UserData::Fills(fills) = user_events {
+                        for fill in fills {
+                            let amount: f64 = fill.sz.parse().unwrap();
+                            // Update our resting positions whenever we see a fill
+                            if fill.side.eq("B") {
+                                self.cur_position += amount;
+                                self.lower_resting.position -= amount;
+                                info!("Fill: bought {amount} {}", self.asset.clone());
+                            } else {
+                                self.cur_position -= amount;
+                                self.upper_resting.position -= amount;
+                                info!("Fill: sold {amount} {}", self.asset.clone());
+                            }
                         }
                     }
                     // Check to see if we need to cancel or place any new orders

@@ -1,13 +1,12 @@
-use crate::meta::SpotMeta;
 use crate::signature::sign_typed_data;
-use crate::Withdraw3;
 use crate::{
-    consts::MAINNET_API_URL,
     exchange::{
         actions::{
-            ApproveAgent, BulkCancel, BulkOrder, UpdateIsolatedMargin, UpdateLeverage, UsdSend,
+            ApproveAgent, ApproveBuilderFee, BulkCancel, BulkModify, BulkOrder, SetReferrer,
+            UpdateIsolatedMargin, UpdateLeverage, UsdSend,
         },
         cancel::{CancelRequest, CancelRequestCloid},
+        modify::{ClientModifyRequest, ModifyRequest},
         ClientCancelRequest, ClientOrderRequest,
     },
     helpers::{generate_random_key, next_nonce, uuid_to_hex_string},
@@ -18,6 +17,7 @@ use crate::{
     signature::sign_l1_action,
     BaseUrl, BulkCancelCloid, Error, ExchangeResponseStatus,
 };
+use crate::{ClassTransfer, SpotSend, SpotUser, VaultTransfer, Withdraw3};
 use ethers::{
     abi::AbiEncode,
     signers::{LocalWallet, Signer},
@@ -29,7 +29,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::cancel::ClientCancelRequestCloid;
+use super::order::{MarketCloseParams, MarketOrderParams};
+use super::{BuilderInfo, ClientLimit, ClientOrder};
 
+#[derive(Debug)]
 pub struct ExchangeClient {
     pub http_client: HttpClient,
     pub wallet: LocalWallet,
@@ -57,8 +60,14 @@ pub enum Actions {
     Order(BulkOrder),
     Cancel(BulkCancel),
     CancelByCloid(BulkCancelCloid),
+    BatchModify(BulkModify),
     ApproveAgent(ApproveAgent),
     Withdraw3(Withdraw3),
+    SpotUser(SpotUser),
+    VaultTransfer(VaultTransfer),
+    SpotSend(SpotSend),
+    SetReferrer(SetReferrer),
+    ApproveBuilderFee(ApproveBuilderFee),
 }
 
 impl Actions {
@@ -94,17 +103,15 @@ impl ExchangeClient {
             info.meta().await?
         };
 
-        let spot_meta: SpotMeta = info.spot_meta().await?;
-
         let mut coin_to_asset = HashMap::new();
         for (asset_ind, asset) in meta.universe.iter().enumerate() {
             coin_to_asset.insert(asset.name.clone(), asset_ind as u32);
         }
 
-        for asset in spot_meta.universe.into_iter() {
-            let spot_ind: u32 = 10000 + asset.index as u32;
-            coin_to_asset.insert(asset.name, spot_ind);
-        }
+        coin_to_asset = info
+            .spot_meta()
+            .await?
+            .add_pair_and_name_to_index_map(coin_to_asset);
 
         Ok(ExchangeClient {
             wallet,
@@ -134,14 +141,12 @@ impl ExchangeClient {
             .map_err(|e| Error::JsonParse(e.to_string()))?;
         debug!("Sending request {res:?}");
 
-        serde_json::from_str(
-            &self
-                .http_client
-                .post("/exchange", res)
-                .await
-                .map_err(|e| Error::JsonParse(e.to_string()))?,
-        )
-        .map_err(|e| Error::JsonParse(e.to_string()))
+        let output = &self
+            .http_client
+            .post("/exchange", res)
+            .await
+            .map_err(|e| Error::JsonParse(e.to_string()))?;
+        serde_json::from_str(output).map_err(|e| Error::JsonParse(e.to_string()))
     }
 
     pub async fn usdc_transfer(
@@ -151,7 +156,7 @@ impl ExchangeClient {
         wallet: Option<&LocalWallet>,
     ) -> Result<ExchangeResponseStatus> {
         let wallet = wallet.unwrap_or(&self.wallet);
-        let hyperliquid_chain = if self.http_client.base_url.eq(MAINNET_API_URL) {
+        let hyperliquid_chain = if self.http_client.is_mainnet() {
             "Mainnet".to_string()
         } else {
             "Testnet".to_string()
@@ -172,12 +177,225 @@ impl ExchangeClient {
         self.post(action, signature, timestamp).await
     }
 
+    pub async fn class_transfer(
+        &self,
+        usdc: f64,
+        to_perp: bool,
+        wallet: Option<&LocalWallet>,
+    ) -> Result<ExchangeResponseStatus> {
+        // payload expects usdc without decimals
+        let usdc = (usdc * 1e6).round() as u64;
+        let wallet = wallet.unwrap_or(&self.wallet);
+
+        let timestamp = next_nonce();
+
+        let action = Actions::SpotUser(SpotUser {
+            class_transfer: ClassTransfer { usdc, to_perp },
+        });
+        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
+        let is_mainnet = self.http_client.is_mainnet();
+        let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
+
+        self.post(action, signature, timestamp).await
+    }
+
+    pub async fn vault_transfer(
+        &self,
+        is_deposit: bool,
+        usd: u64,
+        vault_address: Option<H160>,
+        wallet: Option<&LocalWallet>,
+    ) -> Result<ExchangeResponseStatus> {
+        let vault_address = self
+            .vault_address
+            .or(vault_address)
+            .ok_or(Error::VaultAddressNotFound)?;
+        let wallet = wallet.unwrap_or(&self.wallet);
+
+        let timestamp = next_nonce();
+
+        let action = Actions::VaultTransfer(VaultTransfer {
+            vault_address,
+            is_deposit,
+            usd,
+        });
+        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
+        let is_mainnet = self.http_client.is_mainnet();
+        let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
+
+        self.post(action, signature, timestamp).await
+    }
+
+    pub async fn market_open(
+        &self,
+        params: MarketOrderParams<'_>,
+    ) -> Result<ExchangeResponseStatus> {
+        let slippage = params.slippage.unwrap_or(0.05); // Default 5% slippage
+        let (px, sz_decimals) = self
+            .calculate_slippage_price(params.asset, params.is_buy, slippage, params.px)
+            .await?;
+
+        let order = ClientOrderRequest {
+            asset: params.asset.to_string(),
+            is_buy: params.is_buy,
+            reduce_only: false,
+            limit_px: px,
+            sz: round_to_decimals(params.sz, sz_decimals),
+            cloid: params.cloid,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Ioc".to_string(),
+            }),
+        };
+
+        self.order(order, params.wallet).await
+    }
+
+    pub async fn market_open_with_builder(
+        &self,
+        params: MarketOrderParams<'_>,
+        builder: BuilderInfo,
+    ) -> Result<ExchangeResponseStatus> {
+        let slippage = params.slippage.unwrap_or(0.05); // Default 5% slippage
+        let (px, sz_decimals) = self
+            .calculate_slippage_price(params.asset, params.is_buy, slippage, params.px)
+            .await?;
+
+        let order = ClientOrderRequest {
+            asset: params.asset.to_string(),
+            is_buy: params.is_buy,
+            reduce_only: false,
+            limit_px: px,
+            sz: round_to_decimals(params.sz, sz_decimals),
+            cloid: params.cloid,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Ioc".to_string(),
+            }),
+        };
+
+        self.order_with_builder(order, params.wallet, builder).await
+    }
+
+    pub async fn market_close(
+        &self,
+        params: MarketCloseParams<'_>,
+    ) -> Result<ExchangeResponseStatus> {
+        let slippage = params.slippage.unwrap_or(0.05); // Default 5% slippage
+        let wallet = params.wallet.unwrap_or(&self.wallet);
+
+        let base_url = match self.http_client.base_url.as_str() {
+            "https://api.hyperliquid.xyz" => BaseUrl::Mainnet,
+            "https://api.hyperliquid-testnet.xyz" => BaseUrl::Testnet,
+            _ => return Err(Error::GenericRequest("Invalid base URL".to_string())),
+        };
+        let info_client = InfoClient::new(None, Some(base_url)).await?;
+        let user_state = info_client.user_state(wallet.address()).await?;
+
+        let position = user_state
+            .asset_positions
+            .iter()
+            .find(|p| p.position.coin == params.asset)
+            .ok_or(Error::AssetNotFound)?;
+
+        let szi = position
+            .position
+            .szi
+            .parse::<f64>()
+            .map_err(|_| Error::FloatStringParse)?;
+
+        let (px, sz_decimals) = self
+            .calculate_slippage_price(params.asset, szi < 0.0, slippage, params.px)
+            .await?;
+
+        let sz = round_to_decimals(params.sz.unwrap_or_else(|| szi.abs()), sz_decimals);
+
+        let order = ClientOrderRequest {
+            asset: params.asset.to_string(),
+            is_buy: szi < 0.0,
+            reduce_only: true,
+            limit_px: px,
+            sz,
+            cloid: params.cloid,
+            order_type: ClientOrder::Limit(ClientLimit {
+                tif: "Ioc".to_string(),
+            }),
+        };
+
+        self.order(order, Some(wallet)).await
+    }
+
+    async fn calculate_slippage_price(
+        &self,
+        asset: &str,
+        is_buy: bool,
+        slippage: f64,
+        px: Option<f64>,
+    ) -> Result<(f64, u32)> {
+        let base_url = match self.http_client.base_url.as_str() {
+            "https://api.hyperliquid.xyz" => BaseUrl::Mainnet,
+            "https://api.hyperliquid-testnet.xyz" => BaseUrl::Testnet,
+            _ => return Err(Error::GenericRequest("Invalid base URL".to_string())),
+        };
+        let info_client = InfoClient::new(None, Some(base_url)).await?;
+        let meta = info_client.meta().await?;
+
+        let asset_meta = meta
+            .universe
+            .iter()
+            .find(|a| a.name == asset)
+            .ok_or(Error::AssetNotFound)?;
+
+        let sz_decimals = asset_meta.sz_decimals;
+        let max_decimals: u32 = if self.coin_to_asset[asset] < 10000 {
+            6
+        } else {
+            8
+        };
+        let price_decimals = max_decimals.saturating_sub(sz_decimals);
+
+        let px = if let Some(px) = px {
+            px
+        } else {
+            let all_mids = info_client.all_mids().await?;
+            all_mids
+                .get(asset)
+                .ok_or(Error::AssetNotFound)?
+                .parse::<f64>()
+                .map_err(|_| Error::FloatStringParse)?
+        };
+
+        debug!("px before slippage: {px:?}");
+        let slippage_factor = if is_buy {
+            1.0 + slippage
+        } else {
+            1.0 - slippage
+        };
+        let px = px * slippage_factor;
+
+        // Round to the correct number of decimal places and significant figures
+        let px = round_to_significant_and_decimal(px, 5, price_decimals);
+
+        debug!("px after slippage: {px:?}");
+        Ok((px, sz_decimals))
+    }
+
     pub async fn order(
         &self,
         order: ClientOrderRequest,
         wallet: Option<&LocalWallet>,
     ) -> Result<ExchangeResponseStatus> {
         self.bulk_order(vec![order], wallet).await
+    }
+
+    pub async fn order_with_builder(
+        &self,
+        order: ClientOrderRequest,
+        wallet: Option<&LocalWallet>,
+        builder: BuilderInfo,
+    ) -> Result<ExchangeResponseStatus> {
+        self.bulk_order_with_builder(vec![order], wallet, builder)
+            .await
     }
 
     pub async fn bulk_order(
@@ -197,11 +415,42 @@ impl ExchangeClient {
         let action = Actions::Order(BulkOrder {
             orders: transformed_orders,
             grouping: "na".to_string(),
+            builder: None,
         });
         let connection_id = action.hash(timestamp, self.vault_address)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
 
-        let is_mainnet = self.http_client.base_url == BaseUrl::Mainnet.get_url();
+        let is_mainnet = self.http_client.is_mainnet();
+        let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
+        self.post(action, signature, timestamp).await
+    }
+
+    pub async fn bulk_order_with_builder(
+        &self,
+        orders: Vec<ClientOrderRequest>,
+        wallet: Option<&LocalWallet>,
+        mut builder: BuilderInfo,
+    ) -> Result<ExchangeResponseStatus> {
+        let wallet = wallet.unwrap_or(&self.wallet);
+        let timestamp = next_nonce();
+
+        builder.builder = builder.builder.to_lowercase();
+
+        let mut transformed_orders = Vec::new();
+
+        for order in orders {
+            transformed_orders.push(order.convert(&self.coin_to_asset)?);
+        }
+
+        let action = Actions::Order(BulkOrder {
+            orders: transformed_orders,
+            grouping: "na".to_string(),
+            builder: Some(builder),
+        });
+        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
+
+        let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
         self.post(action, signature, timestamp).await
     }
@@ -240,7 +489,43 @@ impl ExchangeClient {
         let connection_id = action.hash(timestamp, self.vault_address)?;
 
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
-        let is_mainnet = self.http_client.base_url == BaseUrl::Mainnet.get_url();
+        let is_mainnet = self.http_client.is_mainnet();
+        let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
+
+        self.post(action, signature, timestamp).await
+    }
+
+    pub async fn modify(
+        &self,
+        modify: ClientModifyRequest,
+        wallet: Option<&LocalWallet>,
+    ) -> Result<ExchangeResponseStatus> {
+        self.bulk_modify(vec![modify], wallet).await
+    }
+
+    pub async fn bulk_modify(
+        &self,
+        modifies: Vec<ClientModifyRequest>,
+        wallet: Option<&LocalWallet>,
+    ) -> Result<ExchangeResponseStatus> {
+        let wallet = wallet.unwrap_or(&self.wallet);
+        let timestamp = next_nonce();
+
+        let mut transformed_modifies = Vec::new();
+        for modify in modifies.into_iter() {
+            transformed_modifies.push(ModifyRequest {
+                oid: modify.oid,
+                order: modify.order.convert(&self.coin_to_asset)?,
+            });
+        }
+
+        let action = Actions::BatchModify(BulkModify {
+            modifies: transformed_modifies,
+        });
+        let connection_id = action.hash(timestamp, self.vault_address)?;
+
+        let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
+        let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
 
         self.post(action, signature, timestamp).await
@@ -280,7 +565,7 @@ impl ExchangeClient {
 
         let connection_id = action.hash(timestamp, self.vault_address)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
-        let is_mainnet = self.http_client.base_url == BaseUrl::Mainnet.get_url();
+        let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
 
         self.post(action, signature, timestamp).await
@@ -305,7 +590,7 @@ impl ExchangeClient {
         });
         let connection_id = action.hash(timestamp, self.vault_address)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
-        let is_mainnet = self.http_client.base_url == BaseUrl::Mainnet.get_url();
+        let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
 
         self.post(action, signature, timestamp).await
@@ -330,7 +615,7 @@ impl ExchangeClient {
         });
         let connection_id = action.hash(timestamp, self.vault_address)?;
         let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
-        let is_mainnet = self.http_client.base_url == BaseUrl::Mainnet.get_url();
+        let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
 
         self.post(action, signature, timestamp).await
@@ -348,7 +633,7 @@ impl ExchangeClient {
             .map_err(|e| Error::PrivateKeyParse(e.to_string()))?
             .address();
 
-        let hyperliquid_chain = if self.http_client.base_url.eq(MAINNET_API_URL) {
+        let hyperliquid_chain = if self.http_client.is_mainnet() {
             "Mainnet".to_string()
         } else {
             "Testnet".to_string()
@@ -375,7 +660,7 @@ impl ExchangeClient {
         wallet: Option<&LocalWallet>,
     ) -> Result<ExchangeResponseStatus> {
         let wallet = wallet.unwrap_or(&self.wallet);
-        let hyperliquid_chain = if self.http_client.base_url.eq(MAINNET_API_URL) {
+        let hyperliquid_chain = if self.http_client.is_mainnet() {
             "Mainnet".to_string()
         } else {
             "Testnet".to_string()
@@ -395,6 +680,98 @@ impl ExchangeClient {
 
         self.post(action, signature, timestamp).await
     }
+
+    pub async fn spot_transfer(
+        &self,
+        amount: &str,
+        destination: &str,
+        token: &str,
+        wallet: Option<&LocalWallet>,
+    ) -> Result<ExchangeResponseStatus> {
+        let wallet = wallet.unwrap_or(&self.wallet);
+        let hyperliquid_chain = if self.http_client.is_mainnet() {
+            "Mainnet".to_string()
+        } else {
+            "Testnet".to_string()
+        };
+
+        let timestamp = next_nonce();
+        let spot_send = SpotSend {
+            signature_chain_id: 421614.into(),
+            hyperliquid_chain,
+            destination: destination.to_string(),
+            amount: amount.to_string(),
+            time: timestamp,
+            token: token.to_string(),
+        };
+        let signature = sign_typed_data(&spot_send, wallet)?;
+        let action = serde_json::to_value(Actions::SpotSend(spot_send))
+            .map_err(|e| Error::JsonParse(e.to_string()))?;
+
+        self.post(action, signature, timestamp).await
+    }
+
+    pub async fn set_referrer(
+        &self,
+        code: String,
+        wallet: Option<&LocalWallet>,
+    ) -> Result<ExchangeResponseStatus> {
+        let wallet = wallet.unwrap_or(&self.wallet);
+        let timestamp = next_nonce();
+
+        let action = Actions::SetReferrer(SetReferrer { code });
+
+        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
+
+        let is_mainnet = self.http_client.is_mainnet();
+        let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
+        self.post(action, signature, timestamp).await
+    }
+
+    pub async fn approve_builder_fee(
+        &self,
+        builder: String,
+        max_fee_rate: String,
+        wallet: Option<&LocalWallet>,
+    ) -> Result<ExchangeResponseStatus> {
+        let wallet = wallet.unwrap_or(&self.wallet);
+        let timestamp = next_nonce();
+
+        let hyperliquid_chain = if self.http_client.is_mainnet() {
+            "Mainnet".to_string()
+        } else {
+            "Testnet".to_string()
+        };
+
+        let action = Actions::ApproveBuilderFee(ApproveBuilderFee {
+            signature_chain_id: 421614.into(),
+            hyperliquid_chain,
+            builder,
+            max_fee_rate,
+            nonce: timestamp,
+        });
+
+        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
+
+        let is_mainnet = self.http_client.is_mainnet();
+        let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
+        self.post(action, signature, timestamp).await
+    }
+}
+
+fn round_to_decimals(value: f64, decimals: u32) -> f64 {
+    let factor = 10f64.powi(decimals as i32);
+    (value * factor).round() / factor
+}
+
+fn round_to_significant_and_decimal(value: f64, sig_figs: u32, max_decimals: u32) -> f64 {
+    let abs_value = value.abs();
+    let magnitude = abs_value.log10().floor() as i32;
+    let scale = 10f64.powi(sig_figs as i32 - magnitude - 1);
+    let rounded = (abs_value * scale).round() / scale;
+    round_to_decimals(rounded.copysign(value), max_decimals)
 }
 
 #[cfg(test)]
@@ -430,6 +807,7 @@ mod tests {
                 cloid: None,
             }],
             grouping: "na".to_string(),
+            builder: None,
         });
         let connection_id = action.hash(1583838, None)?;
 
@@ -460,6 +838,7 @@ mod tests {
                 cloid: Some(uuid_to_hex_string(cloid.unwrap())),
             }],
             grouping: "na".to_string(),
+            builder: None,
         });
         let connection_id = action.hash(1583838, None)?;
 
@@ -477,13 +856,13 @@ mod tests {
         for (tpsl, mainnet_signature, testnet_signature) in [
             (
                 "tp",
-                "e844cafedb695abbc28b3178b136d262327a72bba1012152f3b5b675147e98312d42de83976b05becf768ad882f6f6a1bfa65afadc71f945c2a98473317097ee1b",
-                "f360f6173c1d9a8ff2d8677e1fc4cb787122542985129c42e8bce47c5d58f6910ee42b10fd69af0bff0dd484e2cb8d3fa8fecfec13bde5e31f5d3d47d1e5a73f1b"
+                "b91e5011dff15e4b4a40753730bda44972132e7b75641f3cac58b66159534a170d422ee1ac3c7a7a2e11e298108a2d6b8da8612caceaeeb3e571de3b2dfda9e41b",
+                "6df38b609904d0d4439884756b8f366f22b3a081801dbdd23f279094a2299fac6424cb0cdc48c3706aeaa368f81959e91059205403d3afd23a55983f710aee871b"
             ),
             (
                 "sl",
-                "d10f92a81428c0b57fb619f206bca34ad0cb668be8305306804b27491b4f9c257a87dbd87ad5b6e2bce2ae466b004f7572c5080672ed58cdcb3ffaedcd9de9111c",
-                "51b70df3ee8afcdf192390ee79a18b54a8ec92c86653e8ef80b0c90a7cf9850500c6653c4aa2317e7312dfc9b2aeba515d801d7e8af66567539861a6d5eb2d2b1c"
+                "8456d2ace666fce1bee1084b00e9620fb20e810368841e9d4dd80eb29014611a0843416e51b1529c22dd2fc28f7ff8f6443875635c72011f60b62cbb8ce90e2d1c",
+                "eb5bdb52297c1d19da45458758bd569dcb24c07e5c7bd52cf76600fd92fdd8213e661e21899c985421ec018a9ee7f3790e7b7d723a9932b7b5adcd7def5354601c"
             )
         ] {
             let wallet = get_wallet()?;
@@ -504,6 +883,7 @@ mod tests {
                     }
                 ],
                 grouping: "na".to_string(),
+                builder: None,
             });
             let connection_id = action.hash(1583838, None)?;
 

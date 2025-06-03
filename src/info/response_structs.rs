@@ -1,5 +1,6 @@
 use crate::{
     info::{AssetPosition, Level, MarginSummary},
+    DailyUserVlm, Delta, FeeSchedule, OrderInfo, Referrer, ReferrerState, UserTokenBalance,
     PerpetualAssetContext, Universe, UniverseItem,
 };
 use serde::{Deserialize, Deserializer};
@@ -114,6 +115,21 @@ pub struct UserStateResponse {
     pub withdrawable: String,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct UserTokenBalanceResponse {
+    pub balances: Vec<UserTokenBalance>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFeesResponse {
+    pub active_referral_discount: String,
+    pub daily_user_vlm: Vec<DailyUserVlm>,
+    pub fee_schedule: FeeSchedule,
+    pub user_add_rate: String,
+    pub user_cross_rate: String,
+}
+
 #[derive(serde::Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenOrdersResponse {
@@ -139,6 +155,7 @@ pub struct UserFillsResponse {
     pub start_position: String,
     pub sz: String,
     pub time: u64,
+    pub fee: String,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -148,6 +165,13 @@ pub struct FundingHistoryResponse {
     pub funding_rate: String,
     pub premium: String,
     pub time: u64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct UserFundingResponse {
+    pub time: u64,
+    pub hash: String,
+    pub delta: Delta,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -191,4 +215,22 @@ pub struct CandlesSnapshotResponse {
     pub vlm: String,
     #[serde(rename = "n")]
     pub num_trades: u64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct OrderStatusResponse {
+    pub status: String,
+    /// `None` if the order is not found
+    #[serde(default)]
+    pub order: Option<OrderInfo>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferralResponse {
+    pub referred_by: Option<Referrer>,
+    pub cum_vlm: String,
+    pub unclaimed_rewards: String,
+    pub claimed_rewards: String,
+    pub referrer_state: ReferrerState,
 }

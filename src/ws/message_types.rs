@@ -45,3 +45,18 @@ pub struct UserFundings {
 pub struct UserNonFundingLedgerUpdates {
     pub data: UserNonFundingLedgerUpdatesData,
 }
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct Notification {
+    pub data: NotificationData,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct WebData2 {
+    pub data: WebData2Data,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct ActiveAssetCtx {
+    pub data: ActiveAssetCtxData,
+}

@@ -2,8 +2,8 @@ use ethers::signers::LocalWallet;
 use log::info;
 
 use hyperliquid_rust_sdk::{
-    BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ExchangeClient,
-    ExchangeDataStatus, ExchangeResponseStatus,
+    BaseUrl, BuilderInfo, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest,
+    ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus,
 };
 use std::{thread::sleep, time::Duration};
 
@@ -20,18 +20,31 @@ async fn main() {
         .unwrap();
 
     let order = ClientOrderRequest {
-        asset: "XYZTWO/USDC".to_string(),
+        asset: "ETH".to_string(),
         is_buy: true,
         reduce_only: false,
-        limit_px: 0.00002378,
-        sz: 1000000.0,
+        limit_px: 1800.0,
+        sz: 0.01,
         cloid: None,
         order_type: ClientOrder::Limit(ClientLimit {
             tif: "Gtc".to_string(),
         }),
     };
 
-    let response = exchange_client.order(order, None).await.unwrap();
+    let fee = 1u64;
+    let builder = "0x1ab189B7801140900C711E458212F9c76F8dAC79";
+
+    let response = exchange_client
+        .order_with_builder(
+            order,
+            None,
+            BuilderInfo {
+                builder: builder.to_string(),
+                fee,
+            },
+        )
+        .await
+        .unwrap();
     info!("Order placed: {response:?}");
 
     let response = match response {
@@ -49,7 +62,7 @@ async fn main() {
     sleep(Duration::from_secs(10));
 
     let cancel = ClientCancelRequest {
-        asset: "HFUN/USDC".to_string(),
+        asset: "ETH".to_string(),
         oid,
     };
 
