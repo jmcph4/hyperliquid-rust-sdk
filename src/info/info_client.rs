@@ -91,7 +91,7 @@ pub enum InfoRequest {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct InfoClient {
     pub http_client: HttpClient,
     pub(crate) ws_manager: Option<WsManager>,
